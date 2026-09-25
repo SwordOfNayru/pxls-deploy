@@ -1,0 +1,146 @@
+name: catboat-place
+
+services:
+  # ---------------------------------------------------------------------------
+  # Base de données. Le serveur crée lui-même ses tables au premier démarrage.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pxls}
+      POSTGRES_USER: ${POSTGRES_USER:-pxls}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?définir POSTGRES_PASSWORD dans .env}
+      # Évite que le locale du conteneur change l'ordre des tris.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pxls} -d ${POSTGRES_DB:-pxls}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [pxls]
+
+  # ---------------------------------------------------------------------------
+  # Back end Java. Compilé par Maven dans l'image (voir ../Pxls/Dockerfile).
+  # Jamais exposé directement : seul pxls-web l'atteint.
+  # ---------------------------------------------------------------------------
+  pxls-server:
+    build:
+      context: ../Pxls
+    image: catboat/pxls-server:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PXLS_HOST: ${PXLS_DOMAIN:?définir PXLS_DOMAIN dans .env}
+      PXLS_PUBLIC_URL: https://${PXLS_DOMAIN}
+      PXLS_CALLBACK_BASE: https://${PXLS_DOMAIN}/auth
+      # Le client public passe par Caddy : c'est son port qui compte ici.
+      PXLS_FRONTEND_PORT: 443
+      PXLS_HTTPS: "true"
+      PXLS_TITLE: ${PXLS_TITLE:-Catboat Place}
+      PXLS_CANVAS_CODE: ${PXLS_CANVAS_CODE:-1}
+      # Propriétaire des fichiers écrits dans ./data (board, backups, logs).
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      # IP fixe de pxls-web : sans elle le serveur ignorerait X-Real-IP et
+      # compterait tous les joueurs comme une seule adresse.
+      PXLS_TRUSTED_PROXY_IP: ${PXLS_WEB_IP:-172.28.0.10}
+      PXLS_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-pxls}
+      PXLS_DB_USER: ${POSTGRES_USER:-pxls}
+      PXLS_DB_PASS: ${POSTGRES_PASSWORD}
+      PXLS_ANNOUNCEMENTS_WEBHOOK: ${PXLS_ANNOUNCEMENTS_WEBHOOK:-}
+      PXLS_CAPTCHA_ENABLED: ${PXLS_CAPTCHA_ENABLED:-false}
+      PXLS_CAPTCHA_KEY: ${PXLS_CAPTCHA_KEY:-}
+      PXLS_CAPTCHA_SECRET: ${PXLS_CAPTCHA_SECRET:-}
+      PXLS_DISCORD_ENABLED: ${PXLS_DISCORD_ENABLED:-false}
+      PXLS_DISCORD_KEY: ${PXLS_DISCORD_KEY:-}
+      PXLS_DISCORD_SECRET: ${PXLS_DISCORD_SECRET:-}
+      PXLS_GOOGLE_ENABLED: ${PXLS_GOOGLE_ENABLED:-false}
+      PXLS_GOOGLE_KEY: ${PXLS_GOOGLE_KEY:-}
+      PXLS_GOOGLE_SECRET: ${PXLS_GOOGLE_SECRET:-}
+      PXLS_REDDIT_ENABLED: ${PXLS_REDDIT_ENABLED:-false}
+      PXLS_REDDIT_KEY: ${PXLS_REDDIT_KEY:-}
+      PXLS_REDDIT_SECRET: ${PXLS_REDDIT_SECRET:-}
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+    # Permet `docker compose attach pxls-server` pour la console d'admin
+    # (ban, roles, alert…). Ctrl-P Ctrl-Q pour se détacher sans tuer le serveur.
+    stdin_open: true
+    tty: true
+    # Le hook d'arrêt sauvegarde board.dat : lui laisser le temps de finir.
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:4567/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks: [pxls]
+
+  # ---------------------------------------------------------------------------
+  # Front end Node. Sert dist/ (build gulp) et relaie le reste vers le back end,
+  # WebSocket compris.
+  # ---------------------------------------------------------------------------
+  pxls-web:
+    build:
+      context: ../pxls-web
+    image: catboat/pxls-web:latest
+    restart: unless-stopped
+    depends_on:
+      pxls-server:
+        condition: service_started
+    environment:
+      WEB_PORT: 3000
+      WEB_PROXY_TO: pxls-server:4567
+      WEB_TITLE: ${PXLS_TITLE:-Catboat Place}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      pxls:
+        ipv4_address: ${PXLS_WEB_IP:-172.28.0.10}
+
+  # ---------------------------------------------------------------------------
+  # Terminaison TLS. Caddy obtient et renouvelle seul le certificat Let's
+  # Encrypt pour PXLS_DOMAIN, à condition que le DNS pointe ici et que les
+  # ports 80 et 443 soient joignables depuis l'extérieur.
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - pxls-web
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PXLS_DOMAIN: ${PXLS_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?définir ACME_EMAIL dans .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Contient les certificats : à conserver pour ne pas les redemander.
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [pxls]
+
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  pxls:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${PXLS_SUBNET:-172.28.0.0/24}

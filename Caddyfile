@@ -1,0 +1,21 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$PXLS_DOMAIN} {
+	encode zstd gzip
+
+	reverse_proxy pxls-web:3000 {
+		# Le back end lit l'IP réelle du joueur dans cet en-tête (pxls.conf,
+		# server.proxy.headers). `header_up` écrase toute valeur envoyée par
+		# le client : impossible d'usurper une IP pour contourner un ban.
+		header_up X-Real-IP {remote_host}
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}
